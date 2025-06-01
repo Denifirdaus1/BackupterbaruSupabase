@@ -1,27 +1,29 @@
+using DataWizard.Core.Services;
+using DataWizard.UI.Services;
+using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
-using Windows.Storage.Pickers;
-using System;
-using System.IO;
-using System.Threading.Tasks;
-using DataWizard.Core.Services;
-using System.Collections.Generic;
-using DataWizard.UI.Services;
-using System.Diagnostics; // Untuk Stopwatch
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
-using Windows.UI.Text;
-using Microsoft.UI.Text;
 using Microsoft.UI.Xaml.Shapes;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics; // Untuk Stopwatch
+using System.IO;
 using System.Linq;
-using System.Data.SqlClient;
+using System.Threading;
+using System.Threading.Tasks;
+using Windows.Storage.Pickers;
+using Windows.UI.Text;
+using System.Threading; // Untuk CancellationTokenSource
+using IOPath = System.IO.Path;
 
 namespace DataWizard.UI.Pages
 {
     public sealed partial class ChatPage : Page
     {
         private string selectedFilePath = "";
-        private readonly string outputTextPath = @"C:\Project PBTGM\DataSample\hasil_output.txt";
+        private readonly string outputTextPath = @"C:\DataSample\hasil_output.txt";
         private readonly DatabaseService _dbService;
         private int _currentUserId = 1; // Temporary hardcoded user ID for testing
         private Stopwatch _processTimer; // Untuk mengukur waktu proses
@@ -33,33 +35,30 @@ namespace DataWizard.UI.Pages
             PromptBox.TextChanged += PromptBox_TextChanged;
             LoadUserPreferences();
             _processTimer = new Stopwatch();
+
+            var outputDir = IOPath.GetDirectoryName(outputTextPath);
+            if (!Directory.Exists(outputDir))
+            {
+                Directory.CreateDirectory(outputDir);
+            }
         }
 
-        // ... (kode lainnya tetap sama sampai RunButton_Click)
         private async void LoadUserPreferences()
         {
             try
             {
-                string preferredFormat = await _dbService.GetUserPreferredFormatAsync(_currentUserId);
-
+                // Since Supabase doesn't have GetUserPreferredFormatAsync, use default Excel format
                 // Reset format buttons
                 WordFormatButton.Style = Resources["DefaultFormatButtonStyle"] as Style;
                 ExcelFormatButton.Style = Resources["DefaultFormatButtonStyle"] as Style;
 
-                // Set preferred format
-                if (preferredFormat == "word")
-                {
-                    WordFormatButton.Style = Resources["SelectedFormatButtonStyle"] as Style;
-                    OutputFormatBox.SelectedIndex = 2;
-                }
-                else // Default to Excel
-                {
-                    ExcelFormatButton.Style = Resources["SelectedFormatButtonStyle"] as Style;
-                    OutputFormatBox.SelectedIndex = 1;
-                }
+                // Set default to Excel
+                ExcelFormatButton.Style = Resources["SelectedFormatButtonStyle"] as Style;
+                OutputFormatBox.SelectedIndex = 1;
             }
             catch (Exception ex)
             {
+                Debug.WriteLine($"Error loading user preferences: {ex.Message}");
                 // Silently fail and use default format
                 ExcelFormatButton.Style = Resources["SelectedFormatButtonStyle"] as Style;
                 OutputFormatBox.SelectedIndex = 1;
@@ -120,25 +119,23 @@ namespace DataWizard.UI.Pages
             string outputFormat = (OutputFormatBox.SelectedItem as ComboBoxItem)?.Content?.ToString().ToLower() ?? "txt";
             string mode = (ModeBox.SelectedItem as ComboBoxItem)?.Content?.ToString().ToLower() ?? "file";
 
-            // Validasi berdasarkan mode
+            // Validasi input dasar terlebih dahulu
             if (string.IsNullOrWhiteSpace(prompt))
             {
                 await ShowDialogAsync("Validation Error", "Harap masukkan prompt terlebih dahulu.");
                 return;
             }
 
-            // Validasi khusus untuk mode file dan ocr
             if ((mode == "file" || mode == "ocr") && string.IsNullOrWhiteSpace(selectedFilePath))
             {
                 await ShowDialogAsync("Validation Error", $"Harap pilih file terlebih dahulu untuk mode {mode.ToUpper()}.");
                 return;
             }
 
-            // Validasi untuk mode OCR - pastikan file adalah gambar
             if (mode == "ocr" && !string.IsNullOrEmpty(selectedFilePath))
             {
                 string[] validImageExtensions = { ".jpg", ".jpeg", ".png", ".bmp", ".tiff" };
-                string fileExtension = System.IO.Path.GetExtension(selectedFilePath).ToLower();
+                string fileExtension = IOPath.GetExtension(selectedFilePath).ToLower();
 
                 if (!validImageExtensions.Contains(fileExtension))
                 {
@@ -152,36 +149,75 @@ namespace DataWizard.UI.Pages
 
             try
             {
+                // Validasi Python environment sebelum memulai
+                OutputBox.Text = "Memeriksa Python environment...";
+                bool pythonValid = await PythonRunner.ValidatePythonEnvironmentAsync().ConfigureAwait(false);
+
+                if (!pythonValid)
+                {
+                    await ShowDialogAsync("Python Error",
+                        "Python tidak ditemukan atau tidak bisa dijalankan.\n\n" +
+                        "Pastikan:\n" +
+                        "1. Python sudah terinstall\n" +
+                        "2. Path Python di PythonRunner.cs sudah benar\n" +
+                        "3. Python bisa dijalankan dari command line");
+                    OutputBox.Text = "Error: Python environment tidak valid.";
+                    return;
+                }
+
+                // Validasi dependensi setelah validasi environment
+                OutputBox.Text = "Memeriksa modul Python...";
+                bool depsValid = await PythonRunner.ValidatePythonDependenciesAsync().ConfigureAwait(false);
+
+                if (!depsValid)
+                {
+                    string pythonPath = PythonRunner.GetPythonPath();
+                    string installCommand = $"\"{pythonPath}\" -m pip install pandas openai python-docx PyPDF2 pdf2image pytesseract pillow";
+
+                    await ShowDialogAsync("Python Dependencies Missing",
+                        $"Modul Python yang diperlukan tidak terinstall!\n\n" +
+                        $"Silakan install dengan menjalankan perintah berikut di Command Prompt (Admin):\n\n" +
+                        $"{installCommand}\n\n" +
+                        $"Setelah menginstall, restart aplikasi.");
+
+                    OutputBox.Text = "Error: Modul Python tidak lengkap";
+                    return;
+                }
+
                 // Mulai mengukur waktu proses
                 _processTimer.Restart();
 
-                // Simpan preferensi format pengguna
-                await _dbService.SaveUserPreferredFormatAsync(_currentUserId, outputFormat);
-
                 WelcomePanel.Visibility = Visibility.Collapsed;
                 AnswerBox.Visibility = Visibility.Visible;
-                OutputBox.Text = "Memproses data... Mohon tunggu.";
+                OutputBox.Text = "Memproses data... Mohon tunggu.\n(Proses ini bisa memakan waktu beberapa menit untuk file besar)";
 
                 // Dapatkan tipe file input sebagai ID integer
                 int inputFileTypeId;
                 if (mode == "prompt-only")
                 {
-                    inputFileTypeId = await _dbService.GetFileTypeId("PROMPT");
+                    inputFileTypeId = await _dbService.GetFileTypeId("PDF").ConfigureAwait(false);
                 }
                 else if (!string.IsNullOrEmpty(selectedFilePath))
                 {
-                    string fileExtension = System.IO.Path.GetExtension(selectedFilePath).TrimStart('.').ToUpper();
-                    inputFileTypeId = await _dbService.GetFileTypeId(fileExtension);
+                    string fileExtension = IOPath.GetExtension(selectedFilePath).TrimStart('.').ToUpper();
+                    string mappedExtension = fileExtension switch
+                    {
+                        "JPEG" => "JPG",
+                        "XLS" => "XLSX",
+                        "CSV" => "XLSX",
+                        _ => fileExtension
+                    };
+                    inputFileTypeId = await _dbService.GetFileTypeId(mappedExtension).ConfigureAwait(false);
                 }
                 else
                 {
-                    inputFileTypeId = await _dbService.GetFileTypeId("UNKNOWN");
+                    inputFileTypeId = await _dbService.GetFileTypeId("PDF").ConfigureAwait(false);
                 }
 
                 // Dapatkan output format ID
                 int outputFormatId = outputFormat == "word" ?
-                    await _dbService.GetOutputFormatId("Word") :
-                    await _dbService.GetOutputFormatId("Excel");
+                    await _dbService.GetOutputFormatId("Word").ConfigureAwait(false) :
+                    await _dbService.GetOutputFormatId("Excel").ConfigureAwait(false);
 
                 // Catat ke history sebelum proses dimulai
                 int historyId = await _dbService.LogHistoryAsync(
@@ -189,45 +225,75 @@ namespace DataWizard.UI.Pages
                     inputFileTypeId,
                     outputFormatId,
                     prompt,
-                    mode);
+                    mode).ConfigureAwait(false);
+
+                if (historyId == -1)
+                {
+                    Debug.WriteLine("Failed to log history, continuing without database logging");
+                }
+
+                // Update status
+                OutputBox.Text = "Menjalankan Python script...";
 
                 // Debugging parameter
-                System.Diagnostics.Debug.WriteLine($"Calling Python with: " +
-                    $"mode={mode}, " +
-                    $"format={outputFormat}, " +
+                Debug.WriteLine($"Calling Python with: mode={mode}, format={outputFormat}, " +
                     $"file={(mode == "prompt-only" ? "none" : selectedFilePath ?? "none")}, " +
                     $"prompt_length={prompt.Length}");
 
                 // Tentukan file path yang akan dikirim ke Python
                 string pythonFilePath = (mode == "prompt-only") ? "none" : selectedFilePath ?? "none";
 
-                string result = await PythonRunner.RunPythonScriptAsync(
-                    pythonFilePath,
-                    outputTextPath,
-                    prompt,
-                    outputFormat,
-                    mode
-                );
+                // Gunakan timeout untuk mencegah hang
+                var timeout = TimeSpan.FromSeconds(300);
+                using var cts = new CancellationTokenSource(timeout);
+
+                string result = "Error: Timeout";
+                try
+                {
+                    result = await PythonRunner.RunPythonScriptAsync(
+                        pythonFilePath,
+                        outputTextPath,
+                        prompt,
+                        outputFormat,
+                        mode
+                    ).ConfigureAwait(false); // PERBAIKAN PENTING: Tambahkan ConfigureAwait(false)
+                }
+                catch (OperationCanceledException)
+                {
+                    result = $"Error: Proses Python timeout setelah {timeout.TotalSeconds} detik";
+                }
+                catch (Exception ex)
+                {
+                    result = $"Error: {ex.Message}";
+                    Debug.WriteLine($"Exception in PythonRunner: {ex}");
+                }
 
                 // Hentikan timer dan dapatkan waktu proses
                 _processTimer.Stop();
                 int processingTimeMs = (int)_processTimer.ElapsedMilliseconds;
 
+                Debug.WriteLine($"Python process completed in {processingTimeMs}ms with result: {result}");
+
                 string outputFileName = string.Empty;
                 string outputFilePath = string.Empty;
 
                 // Cek hasil
-                if (result == "OK" || result == "Success")  // Python script mengembalikan "OK" jika sukses
+                if (result == "Success")
                 {
                     if (File.Exists(outputTextPath))
                     {
-                        string hasil = File.ReadAllText(outputTextPath);
+                        OutputBox.Text = "Membaca hasil...";
+
+                        string hasil = await File.ReadAllTextAsync(outputTextPath).ConfigureAwait(false);
 
                         // Cek apakah hasil mengandung error
-                        if (hasil.StartsWith("[ERROR]"))
+                        if (hasil.StartsWith("[ERROR]") || hasil.StartsWith("[GAGAL]"))
                         {
                             OutputBox.Text = $"Proses gagal: {hasil}";
-                            await _dbService.UpdateHistoryStatusAsync(historyId, false, processingTimeMs);
+                            if (historyId != -1)
+                            {
+                                await _dbService.UpdateHistoryProcessingTimeAsync(historyId, processingTimeMs).ConfigureAwait(false);
+                            }
                             return;
                         }
 
@@ -236,67 +302,106 @@ namespace DataWizard.UI.Pages
                         // Untuk format Excel, cari file parsed
                         if (outputFormat == "excel")
                         {
+                            OutputBox.Text += "\n\nMenunggu file Excel dibuat...";
+
                             string parsedExcelPath = PythonRunner.GetParsedExcelPath(outputTextPath);
+
+                            // Tunggu hingga file Excel terbuat (dengan timeout)
+                            int waitCount = 0;
+                            while (!File.Exists(parsedExcelPath) && waitCount < 10)
+                            {
+                                await Task.Delay(1000).ConfigureAwait(false);
+                                waitCount++;
+                                Debug.WriteLine($"Waiting for Excel file... {waitCount}/10");
+                            }
 
                             if (File.Exists(parsedExcelPath))
                             {
                                 outputFilePath = parsedExcelPath;
-                                outputFileName = System.IO.Path.GetFileName(parsedExcelPath);
+                                outputFileName = IOPath.GetFileName(parsedExcelPath);
                                 ResultFileText.Text = outputFileName;
+                                OutputBox.Text = OutputBox.Text.Replace("Menunggu file Excel dibuat...",
+                                    $"[SUKSES] File Excel berhasil dibuat: {outputFileName}");
                             }
                             else
                             {
-                                OutputBox.Text += "\n\n[INFO] File Excel parsing sedang diproses...";
-
-                                // Tunggu sebentar untuk proses parsing
-                                await Task.Delay(2000);
-
-                                if (File.Exists(parsedExcelPath))
-                                {
-                                    outputFilePath = parsedExcelPath;
-                                    outputFileName = System.IO.Path.GetFileName(parsedExcelPath);
-                                    ResultFileText.Text = outputFileName;
-                                    OutputBox.Text = OutputBox.Text.Replace("[INFO] File Excel parsing sedang diproses...",
-                                        "[INFO] File Excel berhasil dibuat.");
-                                }
+                                OutputBox.Text = OutputBox.Text.Replace("Menunggu file Excel dibuat...",
+                                    "[WARNING] File Excel tidak ditemukan, periksa hasil di file txt.");
                             }
                         }
                         else if (outputFormat == "word")
                         {
                             // Untuk format Word, cari file output
-                            string basePathWord = outputTextPath.Replace("hasil_output.txt", "hasil_output_output.docx");
-                            if (File.Exists(basePathWord))
+                            string basePath = IOPath.GetDirectoryName(outputTextPath);
+                            string baseName = IOPath.GetFileNameWithoutExtension(outputTextPath);
+                            string wordPath = IOPath.Combine(basePath, $"{baseName}_output.docx");
+
+                            // Tunggu hingga file Word terbuat (dengan timeout)
+                            int waitCount = 0;
+                            while (!File.Exists(wordPath) && waitCount < 10)
                             {
-                                outputFilePath = basePathWord;
-                                outputFileName = System.IO.Path.GetFileName(basePathWord);
+                                await Task.Delay(1000).ConfigureAwait(false);
+                                waitCount++;
+                                Debug.WriteLine($"Waiting for Word file... {waitCount}/10");
+                            }
+
+                            if (File.Exists(wordPath))
+                            {
+                                outputFilePath = wordPath;
+                                outputFileName = IOPath.GetFileName(wordPath);
                                 ResultFileText.Text = outputFileName;
+                                OutputBox.Text += $"\n[SUKSES] File Word berhasil dibuat: {outputFileName}";
+                            }
+                            else
+                            {
+                                OutputBox.Text += "\n[WARNING] File Word tidak ditemukan";
                             }
                         }
 
                         // Update history dengan waktu proses
-                        await _dbService.UpdateHistoryProcessingTimeAsync(historyId, processingTimeMs);
-
-                        // Jika ada file output, simpan ke tabel OutputFile
-                        if (!string.IsNullOrEmpty(outputFilePath) && File.Exists(outputFilePath))
+                        if (historyId != -1)
                         {
-                            FileInfo fileInfo = new FileInfo(outputFilePath);
-                            await _dbService.LogOutputFileAsync(
-                                historyId,
-                                outputFileName,
-                                outputFilePath,
-                                fileInfo.Length);
+                            await _dbService.UpdateHistoryProcessingTimeAsync(historyId, processingTimeMs).ConfigureAwait(false);
+
+                            // Jika ada file output, simpan ke tabel OutputFile
+                            if (!string.IsNullOrEmpty(outputFilePath) && File.Exists(outputFilePath))
+                            {
+                                FileInfo fileInfo = new FileInfo(outputFilePath);
+                                await _dbService.LogOutputFileAsync(
+                                    historyId,
+                                    outputFileName,
+                                    outputFilePath,
+                                    fileInfo.Length).ConfigureAwait(false);
+                            }
                         }
                     }
                     else
                     {
-                        OutputBox.Text = "Proses selesai, tetapi file output tidak ditemukan.";
-                        await _dbService.UpdateHistoryStatusAsync(historyId, false, processingTimeMs);
+                        OutputBox.Text = "Proses selesai, tetapi file output tidak ditemukan.\n" +
+                                       "Periksa path output atau coba lagi.";
+                        if (historyId != -1)
+                        {
+                            await _dbService.UpdateHistoryProcessingTimeAsync(historyId, processingTimeMs).ConfigureAwait(false);
+                        }
                     }
                 }
                 else
                 {
-                    OutputBox.Text = $"Proses gagal: {result}";
-                    await _dbService.UpdateHistoryStatusAsync(historyId, false, processingTimeMs);
+                    // Hasil mengandung error
+                    OutputBox.Text = $"Proses gagal:\n{result}";
+
+                    if (historyId != -1)
+                    {
+                        await _dbService.UpdateHistoryProcessingTimeAsync(historyId, processingTimeMs).ConfigureAwait(false);
+                    }
+
+                    // Show detailed error dialog
+                    await ShowDialogAsync("Process Error",
+                        $"Proses gagal dengan error:\n\n{result}\n\n" +
+                        "Tips:\n" +
+                        "- Pastikan file input tidak rusak\n" +
+                        "- Coba dengan prompt yang lebih sederhana\n" +
+                        "- Periksa koneksi internet untuk API Gemini");
                 }
             }
             catch (Exception ex)
@@ -304,31 +409,23 @@ namespace DataWizard.UI.Pages
                 _processTimer.Stop();
                 int processingTimeMs = (int)_processTimer.ElapsedMilliseconds;
 
-                System.Diagnostics.Debug.WriteLine($"Error in RunButton_Click: {ex}");
+                Debug.WriteLine($"Error in RunButton_Click: {ex}");
 
-                string errorMessage = $"Terjadi kesalahan:\n{ex.Message}";
+                string errorMessage = $"Terjadi kesalahan aplikasi:\n{ex.Message}";
                 if (ex.InnerException != null)
                 {
                     errorMessage += $"\n\nDetail: {ex.InnerException.Message}";
                 }
 
                 OutputBox.Text = errorMessage;
-                await ShowDialogAsync("Error", errorMessage);
+                await ShowDialogAsync("Application Error",
+                    $"{errorMessage}\n\n" +
+                    "Silakan coba lagi atau hubungi support jika masalah berlanjut.");
 
-                // Update history jika sudah tercatat
-                try
-                {
-                    // Kita tidak tahu historyId di sini, jadi cukup log error
-                    System.Diagnostics.Debug.WriteLine($"Process failed with exception: {ex}");
-                }
-                catch
-                {
-                    // Silent fail untuk logging
-                }
+                Debug.WriteLine($"Process failed with exception: {ex}");
             }
         }
 
-        // ... (kode lainnya tetap sama)
         private async void FileToFileButton_Click(object sender, RoutedEventArgs e)
         {
             ModeBox.SelectedIndex = 0;
@@ -348,6 +445,7 @@ namespace DataWizard.UI.Pages
             await SelectFileAsync();
         }
 
+
         private async void HistoryButton_Click(object sender, RoutedEventArgs e)
         {
             try
@@ -357,7 +455,6 @@ namespace DataWizard.UI.Pages
                 var historyData = await _dbService.GetRecentHistoryAsync(_currentUserId, 10);
                 Debug.WriteLine($"Successfully retrieved {historyData.Count} history items");
 
-                // ... [kode untuk menampilkan dialog tetap sama] ...
                 var stackPanel = new StackPanel { Spacing = 10 };
 
                 if (historyData.Count == 0)
@@ -409,7 +506,7 @@ namespace DataWizard.UI.Pages
 
                         conversionInfo.Children.Add(new TextBlock
                         {
-                            Text = $"{history.InputType} ? {history.OutputFormat}",
+                            Text = $"{history.InputType} → {history.OutputFormat}",
                             FontSize = 14,
                             FontWeight = history.IsSuccess ? FontWeights.Normal : FontWeights.SemiBold,
                             Foreground = history.IsSuccess ?
@@ -419,7 +516,7 @@ namespace DataWizard.UI.Pages
 
                         conversionInfo.Children.Add(new TextBlock
                         {
-                            Text = $"{history.ProcessDate:dd/MM/yyyy HH:mm} ? {history.ProcessingTime}ms",
+                            Text = $"{history.ProcessDate:dd/MM/yyyy HH:mm} • {history.ProcessingTime}ms",
                             FontSize = 12,
                             Foreground = new SolidColorBrush(Microsoft.UI.Colors.Gray)
                         });
@@ -440,7 +537,7 @@ namespace DataWizard.UI.Pages
                     }
                 }
 
-                // 3. Create and show dialog
+                // Create and show dialog
                 var dialog = new ContentDialog
                 {
                     Title = "Riwayat Konversi",
@@ -457,34 +554,27 @@ namespace DataWizard.UI.Pages
                     DefaultButton = ContentDialogButton.Close
                 };
 
-                // 4. Add debug info to output window
                 Debug.WriteLine("Showing history dialog");
                 await dialog.ShowAsync();
                 Debug.WriteLine("History dialog closed");
             }
-            catch (SqlException sqlEx)
-            {
-                Debug.WriteLine($"SQL Error loading history: {sqlEx.ToString()}");
-                await ShowDialogAsync("Database Error",
-                    $"Terjadi kesalahan database:\n{sqlEx.Message}\n\n" +
-                    $"Kode Error: {sqlEx.Number}\n" +
-                    $"Silakan hubungi administrator.");
-            }
             catch (Exception ex)
             {
-                Debug.WriteLine($"General Error loading history: {ex.ToString()}");
+                Debug.WriteLine($"Error loading history: {ex.ToString()}");
                 await ShowDialogAsync("Error",
                     $"Gagal memuat riwayat:\n{ex.Message}\n\n" +
                     $"User ID: {_currentUserId}\n" +
                     $"Silakan cek log untuk detail lebih lanjut.");
             }
         }
+
         private void CheckCurrentUserId()
         {
             Debug.WriteLine($"Current User ID: {_currentUserId}");
             // Atau tampilkan di UI sementara
             OutputBox.Text = $"Current User ID: {_currentUserId}";
         }
+
         private async void OutputFormatButton_Click(object sender, RoutedEventArgs e)
         {
             Button clickedButton = sender as Button;
@@ -496,8 +586,9 @@ namespace DataWizard.UI.Pages
             clickedButton.Style = Resources["SelectedFormatButtonStyle"] as Style;
             OutputFormatBox.SelectedIndex = format == "word" ? 2 : 1;
 
-            // Save user's format preference
-            await _dbService.SaveUserPreferredFormatAsync(_currentUserId, format);
+            // Note: SaveUserPreferredFormatAsync not available in current Supabase implementation
+            // Could be added later if needed
+            Debug.WriteLine($"User selected format: {format}");
         }
 
         private void RefreshPromptButton_Click(object sender, RoutedEventArgs e)
@@ -514,6 +605,7 @@ namespace DataWizard.UI.Pages
             WelcomePanel.Visibility = Visibility.Visible;
             AnswerBox.Visibility = Visibility.Collapsed;
         }
+
         private void HomeButton_Click(object sender, RoutedEventArgs e)
         {
             // Navigate to the HomePage
@@ -547,14 +639,11 @@ namespace DataWizard.UI.Pages
             {
                 try
                 {
-                    // Get the current folder ID (you'll need to implement this based on your UI)
-                    int currentFolderId = 1; // Temporary hardcoded folder ID for testing
-
-                    // Save file reference to database
-                    await _dbService.SaveFileToFolderAsync(_currentUserId, currentFolderId,
-                        file.Name, file.Path);
-
                     OutputBox.Text = $"File saved to: {file.Path}";
+
+                    // Note: SaveFileToFolderAsync not available in current Supabase implementation
+                    // The file saving functionality still works, just without database tracking
+                    Debug.WriteLine($"File saved locally: {file.Path}");
                 }
                 catch (Exception ex)
                 {
@@ -562,6 +651,5 @@ namespace DataWizard.UI.Pages
                 }
             }
         }
-
     }
 }
