@@ -6,6 +6,10 @@ from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
 import pytesseract
 from PIL import Image
+import sys
+
+# Set Tesseract path explicitly
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 def extract_text_from_pdf(file_path):
     try:
@@ -19,6 +23,9 @@ def extract_text_from_pdf(file_path):
 
 def extract_text_from_scanned_pdf(file_path):
     try:
+        # Debugging: Print Tesseract path
+        print(f"[DEBUG] Menggunakan Tesseract di: {pytesseract.pytesseract.tesseract_cmd}")
+        
         images = convert_from_path(file_path, dpi=300)
         text = ""
         for img in images:
@@ -28,14 +35,16 @@ def extract_text_from_scanned_pdf(file_path):
         return f"[GAGAL] Gagal OCR PDF: {e}"
 
 def extract_from_image(file_path):
-    from PIL import Image
-    import pytesseract
     try:
+        # Debugging: Print Tesseract path
+        print(f"[DEBUG] Menggunakan Tesseract di: {pytesseract.pytesseract.tesseract_cmd}")
+        
         img = Image.open(file_path)
         text = pytesseract.image_to_string(img)
         return text.strip()
     except Exception as e:
         return f"[GAGAL] Gagal membaca gambar: {e}"
+
 
 
 def extract_smart_snippet(text, parts=3):
